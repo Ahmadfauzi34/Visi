@@ -381,7 +381,7 @@ class RouterStage(PipelineStage):
         "pixel_art": {
             "resize_method": Image.Resampling.NEAREST,
             "quantize_method": "exact",
-            "cleanup": "none",
+            "cleanup": "smart",  # changed from 'none' to 'smart' to allow self-cleaning of JPEG noise
             "detail_preserve": "high",
             "n_colors": "auto_low",
             "use_lab": False,
@@ -559,22 +559,31 @@ class GridSizeStage(PipelineStage):
         sum_dx = np.sum(dx, axis=0)
         sum_dy = np.sum(dy, axis=1)
 
-        peaks_x = np.where(sum_dx > np.mean(sum_dx) * 1.5)[0]
-        peaks_y = np.where(sum_dy > np.mean(sum_dy) * 1.5)[0]
+        # Adaptive Grid Size via Shifted Difference (Autocorrelation-like)
+        # Finds the exact upscaling factor / pixel block size more reliably than simple peak detection
+        def find_period(arr1d, max_shift=64):
+            errors = []
+            max_s = min(max_shift, len(arr1d) // 2)
+            if max_s < 2: return 0.0
+            for shift in range(1, max_s):
+                err = np.mean(np.abs(arr1d[shift:] - arr1d[:-shift]))
+                errors.append((shift, err))
 
-        def extract_scale(peaks):
-            if len(peaks) < 2: return 0.0
-            diffs = np.diff(peaks)
-            valid = diffs[diffs >= 2]
-            if len(valid) == 0: return 0.0
-            # Stronger snapping to exact integer grid scales to prevent "line keluar" (jagged misalignment)
-            unique, counts = np.unique(np.round(valid), return_counts=True)
-            best_diff = unique[np.argmax(counts)]
-            close = valid[np.abs(valid - best_diff) <= 1.5]
-            return float(np.round(np.mean(close))) if len(close) > 0 else float(best_diff)
+            # Find local minima in error
+            minima = []
+            for i in range(1, len(errors)-1):
+                if errors[i][1] < errors[i-1][1] and errors[i][1] < errors[i+1][1]:
+                    minima.append(errors[i])
 
-        scale_x = extract_scale(peaks_x)
-        scale_y = extract_scale(peaks_y)
+            if not minima:
+                return 0.0
+
+            minima.sort(key=lambda x: x[1])
+            # The true scale is usually the first strong minimum.
+            return float(minima[0][0])
+
+        scale_x = find_period(sum_dx)
+        scale_y = find_period(sum_dy)
 
         # Continuous fallback if signal is too weak
         if scale_x == 0 and scale_y == 0:
@@ -720,7 +729,9 @@ class QuantizeStage(PipelineStage):
             return min(24, max(8, int(uc // 3)))
 
     def _quantize_exact(self, pixels: np.ndarray, n: int) -> List[Tuple[int, int, int]]:
-        rounded = (pixels // 16) * 16
+        # Increased block rounding step from 16 to 32 to better cluster JPEG noise
+        # before finding the exact palette colors.
+        rounded = (pixels // 32) * 32
         unique, counts = np.unique(rounded, axis=0, return_counts=True)
         top_idx = np.argsort(counts)[-n:]
         palette = [tuple(map(int, unique[i])) for i in top_idx]
@@ -859,10 +870,20 @@ class CleanupStage(PipelineStage):
         if mode == "none":
             return
 
+        # For true pixel art architectures, spatial cleanup often destroys hard structures (like doors/windows).
+        # We must disable destructive cleanup by default for pixel art strategies to avoid "melting".
+        if ctx.strategy_name == "pixel_art":
+            return
+
         # Dynamic threshold based on analysis. Less cleanup for structured pixel art
         quant_score = ctx.analysis.get("quantization_score", 0.0)
         if mode == "smart":
-            if quant_score > 0.6:
+            # If there's a huge discrepancy between physical unique colors (from JPEG noise)
+            # and what a clean image should have, we force heavy cleanup
+            uc = ctx.analysis.get("unique_colors", 0)
+            if uc > 500:
+                mode = "heavy"
+            elif quant_score > 0.6:
                 mode = "none" # True pixel art needs no cleanup, preserves single pixels
             elif quant_score > 0.3:
                 mode = "light"
@@ -872,26 +893,23 @@ class CleanupStage(PipelineStage):
         if mode == "none":
             return
 
-        min_n = 1 if mode == "light" else 2
+        # Structure Evaluation Feedback Loop
         cleaned = grid.copy()
+        from collections import Counter
 
-        # We replace isolated pixels with the majority color of their neighbors,
-        # instead of just setting them to 0 (which punches holes).
-        for y in range(h):
-            for x in range(w):
-                if cleaned[y, x] == 0:
-                    continue
-                val = cleaned[y, x]
+        passes = 1 if mode == "light" else (3 if mode == "heavy" else 2)
+        if mode == "smart" and quant_score < 0.5:
+            passes = 3
 
-                # Check 4-connected neighbors of same color
-                neighbors_same = 0
-                if y > 0 and cleaned[y - 1, x] == val: neighbors_same += 1
-                if y < h - 1 and cleaned[y + 1, x] == val: neighbors_same += 1
-                if x > 0 and cleaned[y, x - 1] == val: neighbors_same += 1
-                if x < w - 1 and cleaned[y, x + 1] == val: neighbors_same += 1
+        for _ in range(passes):
+            new_cleaned = cleaned.copy()
+            for y in range(h):
+                for x in range(w):
+                    if cleaned[y, x] == 0:
+                        continue
+                    val = cleaned[y, x]
 
-                if neighbors_same <= min_n:
-                    # Gather 8-connected neighbor colors to find majority
+                    # Gather 8-connected neighbor colors
                     all_n = []
                     for dy in (-1, 0, 1):
                         for dx in (-1, 0, 1):
@@ -902,13 +920,27 @@ class CleanupStage(PipelineStage):
                                 all_n.append(cleaned[ny, nx])
 
                     if not all_n:
-                        cleaned[y, x] = 0
+                        continue
+
+                    majority = Counter(all_n).most_common(1)[0][0]
+                    neighbors_same = all_n.count(val)
+
+                    if mode == "heavy" or passes > 1:
+                        # For aggressive merging, we must STILL protect strict pixel-art structures.
+                        direct_n = []
+                        for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                            ny, nx = y + dy, x + dx
+                            if 0 <= ny < h and 0 <= nx < w and cleaned[ny, nx] != 0:
+                                direct_n.append(cleaned[ny, nx])
+
+                        cardinal_same = direct_n.count(val)
+                        if cardinal_same < 2:  # Not part of a straight continuous line
+                            if neighbors_same < 3 and all_n.count(majority) >= 3:
+                                new_cleaned[y, x] = majority
                     else:
-                        from collections import Counter
-                        majority = Counter(all_n).most_common(1)[0][0]
-                        # Only replace if majority is strong enough
-                        if all_n.count(majority) > len(all_n) // 2:
-                            cleaned[y, x] = majority
+                        if neighbors_same <= 1 and all_n.count(majority) > len(all_n) // 2:
+                            new_cleaned[y, x] = majority
+            cleaned = new_cleaned
 
         ctx.grid = cleaned
 
