@@ -418,6 +418,16 @@ class RouterStage(PipelineStage):
             "path_opt": True,
             "description": "Hybrid — auto-detect per region",
         },
+        "exact_trace": {
+            "resize_method": Image.Resampling.NEAREST,
+            "quantize_method": "fast_pil",
+            "cleanup": "none",
+            "detail_preserve": "exact",
+            "n_colors": "auto_exact",
+            "use_lab": False,
+            "path_opt": True,
+            "description": "Exact Trace — bypass downsizing and accurately trace image at native size",
+        },
     }
 
     def run(self, ctx: PipelineContext) -> None:
@@ -456,6 +466,7 @@ class RouterStage(PipelineStage):
             "vector_approx": v_score,
             "photo_simplified": ph_score,
             "hybrid": 1.0,  # baseline
+            "exact_trace": 1.5,  # Slightly favored baseline fallback if requested or forced by args
         }
 
         best = max(scores, key=scores.get)
@@ -501,7 +512,7 @@ class CropStage(PipelineStage):
         self.padding = padding
 
     def run(self, ctx: PipelineContext) -> None:
-        if not ctx.user_params.get("crop_content", True):
+        if not ctx.user_params.get("crop_content", True) or ctx.strategy_name == "exact_trace":
             return
         img = ctx.image
         assert img is not None
@@ -578,7 +589,11 @@ class GridSizeStage(PipelineStage):
 
         auto_gs = (max(1, int(round(w / scale))), max(1, int(round(h / scale))))
 
-        if max_dim:
+        if ctx.strategy_name == "exact_trace":
+            # Exact trace preserves full resolution, bypassing downscaling
+            gs = (w, h)
+            scale = 1.0
+        elif max_dim:
             aspect = w / h if h else 1
             if aspect >= 1:
                 gs = (max_dim, max(1, int(round(max_dim / aspect))))
@@ -632,7 +647,15 @@ class QuantizeStage(PipelineStage):
         nc = self._resolve_n_colors(ctx)
 
         qm = ctx.strategy_config.get("quantize_method", "exact")
-        if qm == "exact":
+
+        # If fast_pil is selected (e.g., for full-resolution tracing where k-means is too slow), bypass custom implementations
+        if qm == "fast_pil":
+            pil_img = ctx.image.convert("RGB")
+            # Quantize using PIL's fast native method
+            q_img = pil_img.quantize(colors=nc, method=Image.Quantize.MAXCOVERAGE)
+            raw_pal = q_img.getpalette()[:nc*3]
+            palette = [tuple(raw_pal[i:i+3]) for i in range(0, len(raw_pal), 3)]
+        elif qm == "exact":
             palette = self._quantize_exact(pixels, nc)
         elif qm == "kmeans_rich":
             palette = self._quantize_kmeans(pixels, nc, use_lab)
@@ -655,8 +678,18 @@ class QuantizeStage(PipelineStage):
         ctx.color_map = {i + 1: rgb_to_hex(p) for i, p in enumerate(ctx.palette)}
         ctx.metadata["n_colors"] = len(ctx.palette)
 
-        # Quantize grid (perceptual)
-        ctx.grid = self._quantize_grid(arr, ctx.palette, use_lab, ctx)
+        # Quantize grid
+        if qm == "fast_pil":
+            q_img_arr = np.array(q_img)
+            # PIL quantization returns indices mapped to its own palette order.
+            # We must map these back to our 1-based palette index.
+            ctx.grid = q_img_arr + 1
+            # If there was an alpha channel, mask out background
+            if ctx.user_params.get("remove_background", True):
+                alpha = arr[:, :, 3]
+                ctx.grid[alpha <= 50] = 0
+        else:
+            ctx.grid = self._quantize_grid(arr, ctx.palette, use_lab, ctx)
 
     def _resolve_n_colors(self, ctx: PipelineContext) -> int:
         if isinstance(self.n_colors, int):
@@ -675,6 +708,9 @@ class QuantizeStage(PipelineStage):
             return min(32, max(16, int(uc // 3)))
         elif nc_cfg == "auto_medium":
             return min(24, max(8, int(uc // 4)))
+        elif nc_cfg == "auto_exact":
+            # For exact_trace, allow a larger palette to maintain color fidelity
+            return min(256, max(32, int(uc // 2)))
         else:
             if a.get("quantization_score", 0) > 0.4:
                 # User preference: stepped colors (6 > 16 > 20)
@@ -1028,38 +1064,11 @@ def mask_to_svg_paths(mask: np.ndarray, scale: float, offset_x: float, offset_y:
                     simp.append(p1)
             simp.append(poly[-1])
 
-            # Sub-pixel rounding for less "kaku" edges (corner smoothing)
-            cmds = []
-            if len(simp) > 3:
-                # Start midway between simp[0] and simp[1]
-                p0, p1 = simp[0], simp[1]
-                sx, sy = (p0[0] + p1[0])/2 * scale + offset_x, (p0[1] + p1[1])/2 * scale + offset_y
-                cmds.append(f"M {sx:.2f} {sy:.2f}")
-
-                for i in range(1, len(simp)-1):
-                    prev_p, curr_p, next_p = simp[i-1], simp[i], simp[i+1]
-
-                    # Midpoint of the line going into the corner
-                    m1x, m1y = (prev_p[0] + curr_p[0])/2 * scale + offset_x, (prev_p[1] + curr_p[1])/2 * scale + offset_y
-
-                    # The corner itself
-                    cx, cy = curr_p[0] * scale + offset_x, curr_p[1] * scale + offset_y
-
-                    # Midpoint of the line going out of the corner
-                    m2x, m2y = (curr_p[0] + next_p[0])/2 * scale + offset_x, (curr_p[1] + next_p[1])/2 * scale + offset_y
-
-                    cmds.append(f"L {m1x:.2f} {m1y:.2f}")
-                    # Curve around the corner
-                    cmds.append(f"C {cx:.2f} {cy:.2f} {cx:.2f} {cy:.2f} {m2x:.2f} {m2y:.2f}")
-
-                # Close back to start
-                cmds.append(f"L {sx:.2f} {sy:.2f} Z")
-            else:
-                cmds = [f"M {simp[0][0]*scale + offset_x:.2f} {simp[0][1]*scale + offset_y:.2f}"]
-                for p in simp[1:-1]:
-                    ex, ey = p[0]*scale + offset_x, p[1]*scale + offset_y
-                    cmds.append(f"C {ex:.2f} {ey:.2f} {ex:.2f} {ey:.2f} {ex:.2f} {ey:.2f}")
-                cmds.append("Z")
+            # When tracing full resolution exactly, we prefer straight lines to avoid drifting from original shape
+            cmds = [f"M {simp[0][0]*scale + offset_x:.2f} {simp[0][1]*scale + offset_y:.2f}"]
+            for p in simp[1:]:
+                cmds.append(f"L {p[0]*scale + offset_x:.2f} {p[1]*scale + offset_y:.2f}")
+            cmds.append("Z")
 
             parts.append(" ".join(cmds))
 
@@ -1622,7 +1631,7 @@ def main():
     p_conv.add_argument("output", help="Output SVG path")
     p_conv.add_argument("--grid-size", default="auto", help="Grid size: auto, N, or WxH")
     p_conv.add_argument("--colors", default="auto", help="Number of colors (auto or int)")
-    p_conv.add_argument("--strategy", choices=["pixel_art", "vector_approx", "photo_simplified", "hybrid"], help="Force strategy")
+    p_conv.add_argument("--strategy", choices=["pixel_art", "vector_approx", "photo_simplified", "hybrid", "exact_trace"], help="Force strategy")
     p_conv.add_argument("--palette-hint", nargs="+", help="Hex color hints")
     p_conv.add_argument("--detail", choices=["high", "medium", "low", "adaptive"], help="Detail preservation")
     p_conv.add_argument("--cleanup", choices=["none", "light", "heavy", "smart"], help="Cleanup mode")
