@@ -601,8 +601,12 @@ class GridSizeStage(PipelineStage):
         scale = np.round(scale) # Snap scale to exact integer to fix "line keluar" misalignment on JPEGs
         scale = max(2.0, min(scale, min(w, h) / 8.0))
 
-
-        auto_gs = (max(1, int(round(w / scale))), max(1, int(round(h / scale))))
+        # For pixel art with non-perfect cropped boundaries (e.g. 554 pixels / 9 scale = 61.5 blocks)
+        # We must truncate (floor), not round, to avoid inventing a block out of a thin 5px border
+        if ctx.strategy_name == "pixel_art":
+            auto_gs = (max(1, int(w // scale)), max(1, int(h // scale)))
+        else:
+            auto_gs = (max(1, int(round(w / scale))), max(1, int(round(h / scale))))
 
         if ctx.strategy_name == "exact_trace":
             # Exact trace preserves full resolution, bypassing downscaling
@@ -669,7 +673,22 @@ class ResizeStage(PipelineStage):
                     ex = max(sx + 1, ex)
                     ey = max(sy + 1, ey)
 
-                    block = snapped_arr[sy:ey, sx:ex].reshape(-1, 4)
+                    # Center crop to avoid sub-pixel edge overlap. If the block is 9x9 pixels,
+                    # we ignore the outer borders and only sample the dead center of the block.
+                    # This makes the mapping completely immune to border anti-aliasing and grid drift.
+                    margin_x = max(0, int((ex - sx) * 0.25))
+                    margin_y = max(0, int((ey - sy) * 0.25))
+
+                    csx = sx + margin_x
+                    cex = ex - margin_x
+                    csy = sy + margin_y
+                    cey = ey - margin_y
+
+                    # Fallback if too small
+                    if cex <= csx: cex = csx + 1
+                    if cey <= csy: cey = csy + 1
+
+                    block = snapped_arr[csy:cey, csx:cex].reshape(-1, 4)
                     unique, counts = np.unique(block, axis=0, return_counts=True)
                     majority_color = unique[np.argmax(counts)]
                     out[gy, gx] = majority_color
