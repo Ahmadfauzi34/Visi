@@ -50,6 +50,11 @@ from typing import (
 )
 
 import numpy as np
+try:
+    import scipy.ndimage as ndimage
+    HAS_SCIPY = True
+except ImportError:
+    HAS_SCIPY = False
 from PIL import Image, ImageFilter, ImageStat
 
 # ---------------------------------------------------------------------------
@@ -247,6 +252,7 @@ class Pipeline:
                 use_lab=kwargs.get("use_lab", None),  # None = auto from strategy
             )
             | CleanupStage()
+            | EvaluationStage()
             | OutputStage(
                 pixel_size=kwargs.get("pixel_size", 16),
                 use_paths=kwargs.get("use_paths", True),
@@ -623,9 +629,41 @@ class ResizeStage(PipelineStage):
         img = ctx.image
         assert img is not None
         gw, gh = ctx.metadata["grid_size"]
-        method = ctx.strategy_config.get("resize_method", Image.Resampling.NEAREST)
-        ctx.image = img.resize((gw, gh), method)
-        ctx.arr = np.array(ctx.image.convert("RGBA"))
+
+        # For pixel art, standard resampling (even NEAREST) is mathematically flawed
+        # when dealing with lossy JPEG compression because it samples a single skewed point
+        # or interpolates noise. Instead, we use Block Majority Voting.
+        if ctx.strategy_name == "pixel_art" and (gw, gh) != img.size:
+            arr_orig = np.array(img.convert("RGBA"))
+            h_orig, w_orig, _ = arr_orig.shape
+            scale_x = w_orig / gw
+            scale_y = h_orig / gh
+
+            # Pre-round colors to cluster JPEG artifacts before voting
+            rounded = (arr_orig // 32) * 32
+            out = np.zeros((gh, gw, 4), dtype=np.uint8)
+
+            for gy in range(gh):
+                for gx in range(gw):
+                    sx = int(gx * scale_x)
+                    sy = int(gy * scale_y)
+                    ex = int((gx + 1) * scale_x)
+                    ey = int((gy + 1) * scale_y)
+
+                    ex = max(sx + 1, ex)
+                    ey = max(sy + 1, ey)
+
+                    block = rounded[sy:ey, sx:ex].reshape(-1, 4)
+                    unique, counts = np.unique(block, axis=0, return_counts=True)
+                    majority_color = unique[np.argmax(counts)]
+                    out[gy, gx] = majority_color
+
+            ctx.image = Image.fromarray(out)
+            ctx.arr = out
+        else:
+            method = ctx.strategy_config.get("resize_method", Image.Resampling.NEAREST)
+            ctx.image = img.resize((gw, gh), method)
+            ctx.arr = np.array(ctx.image.convert("RGBA"))
 
 
 class QuantizeStage(PipelineStage):
@@ -729,9 +767,9 @@ class QuantizeStage(PipelineStage):
             return min(24, max(8, int(uc // 3)))
 
     def _quantize_exact(self, pixels: np.ndarray, n: int) -> List[Tuple[int, int, int]]:
-        # Increased block rounding step from 16 to 32 to better cluster JPEG noise
-        # before finding the exact palette colors.
-        rounded = (pixels // 32) * 32
+        # If the image was resized using majority voting, the pixels are already heavily clustered.
+        # We round slightly just to merge extremely close edge cases.
+        rounded = (pixels // 16) * 16
         unique, counts = np.unique(rounded, axis=0, return_counts=True)
         top_idx = np.argsort(counts)[-n:]
         palette = [tuple(map(int, unique[i])) for i in top_idx]
@@ -943,6 +981,54 @@ class CleanupStage(PipelineStage):
             cleaned = new_cleaned
 
         ctx.grid = cleaned
+
+
+class EvaluationStage(PipelineStage):
+    """Evaluates the final grid for structural metrics."""
+
+    def run(self, ctx: PipelineContext) -> None:
+        grid = ctx.grid
+        if grid is None or grid.size == 0:
+            return
+
+        h, w = grid.shape
+
+        # 1. Symmetry
+        mid = w // 2
+        left_half = grid[:, :mid]
+        if w % 2 == 0:
+            right_half_mirrored = grid[:, mid:][:, ::-1]
+        else:
+            right_half_mirrored = grid[:, mid + 1:][:, ::-1]
+
+        symmetry_score = np.mean(left_half == right_half_mirrored)
+
+        # 2. Center of Mass
+        mask = grid > 0
+        if np.sum(mask) == 0:
+            cm_x, cm_y = 0.5, 0.5
+        else:
+            y_coords, x_coords = np.nonzero(mask)
+            cm_y = np.mean(y_coords) / h
+            cm_x = np.mean(x_coords) / w
+
+        # 3. Outline Integrity
+        outline_integrity = 1.0
+        if HAS_SCIPY:
+            struct = ndimage.generate_binary_structure(2, 1)
+            eroded = ndimage.binary_erosion(mask, structure=struct)
+            outline = mask ^ eroded
+
+            if np.sum(outline) > 0:
+                neighbor_count = ndimage.convolve(outline.astype(int), np.ones((3, 3), dtype=int), mode='constant', cval=0) - outline.astype(int)
+                continuous_outline_pixels = np.sum((outline > 0) & (neighbor_count >= 2))
+                outline_integrity = continuous_outline_pixels / np.sum(outline)
+
+        ctx.metadata["structural_evaluation"] = {
+            "symmetry": float(symmetry_score),
+            "center_of_mass": (float(cm_x), float(cm_y)),
+            "outline_integrity": float(outline_integrity)
+        }
 
 
 class OutputStage(PipelineStage):
@@ -1610,6 +1696,9 @@ def _cli_convert(args):
     print(f"✓ Converted: {args.input} -> {args.output}")
     print(f"  Strategy: {meta.get('strategy_name', '?')} (confidence: {meta.get('strategy_confidence', 0):.0%})")
     print(f"  Grid: {meta['grid_size']}, Colors: {meta['n_colors']}")
+    if "structural_evaluation" in meta:
+        struct = meta["structural_evaluation"]
+        print(f"  Structure: symmetry={struct['symmetry']:.2f}, cm=({struct['center_of_mass'][0]:.2f}, {struct['center_of_mass'][1]:.2f}), outline={struct['outline_integrity']:.2f}")
     print(f"  SVG mode: {'path-based' if use_paths else 'rect-optimized'}")
     print(f"  Time: {dt:.2f}s")
 
