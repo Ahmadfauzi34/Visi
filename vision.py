@@ -50,6 +50,11 @@ from typing import (
 )
 
 import numpy as np
+try:
+    import scipy.ndimage as ndimage
+    HAS_SCIPY = True
+except ImportError:
+    HAS_SCIPY = False
 from PIL import Image, ImageFilter, ImageStat
 
 # ---------------------------------------------------------------------------
@@ -247,6 +252,7 @@ class Pipeline:
                 use_lab=kwargs.get("use_lab", None),  # None = auto from strategy
             )
             | CleanupStage()
+            | EvaluationStage()
             | OutputStage(
                 pixel_size=kwargs.get("pixel_size", 16),
                 use_paths=kwargs.get("use_paths", True),
@@ -301,11 +307,43 @@ class AnalysisStage(PipelineStage):
         edge_density = float(np.sum(edges > 30) / edges.size)
 
         lum = 0.299 * pixels[:, 0] + 0.587 * pixels[:, 1] + 0.114 * pixels[:, 2]
-        has_outline = bool(np.sum(lum < 50) / len(pixels) > 0.05)
+        has_outline = bool(np.sum(lum < 75) / len(pixels) > 0.02)
 
-        # Continuous quantization score (0-1), not boolean
-        total_pixels = w * h
-        quant_score = 1.0 - min(1.0, len(unique) / max(50, total_pixels / 500))
+        # Continuous quantization score via cumulative color frequency (robust to noise)
+        sorted_counts = np.sort(counts)[::-1]
+        cumulative = np.cumsum(sorted_counts) / counts.sum()
+        # Number of colors needed to represent 95% of the image
+        effective_colors = np.searchsorted(cumulative, 0.95) + 1
+
+        # New color score logic (max 0)
+        color_score = max(0.0, 1.0 - (effective_colors / 200.0) ** 0.5)
+
+        # Also check gradient sparsity and blockiness (sharpness)
+        arr_f = arr.astype(np.float64) / 255.0
+        dx = np.sum(np.abs(arr_f[:, 1:] - arr_f[:, :-1]), axis=2)
+        dy = np.sum(np.abs(arr_f[1:, :] - arr_f[:-1, :]), axis=2)
+
+        sum_dx = dx.sum(axis=0)
+        sum_dy = dy.sum(axis=1)
+
+        # Blockiness: variance to mean ratio of grid gradients.
+        # High for scaled pixel art (due to grid lines), low for photos.
+        var_x = np.var(sum_dx) / np.mean(sum_dx) if np.mean(sum_dx) > 0 else 0
+        var_y = np.var(sum_dy) / np.mean(sum_dy) if np.mean(sum_dy) > 0 else 0
+        blockiness = (var_x + var_y) / 2.0
+
+        # Normalize blockiness (typically > 5 for scaled pixel art, < 1 for photos)
+        block_score = min(1.0, blockiness / 10.0)
+
+        # Measure flat areas (characteristic of pixel art/highly quantized images).
+        # Relaxed threshold to 15/255 to account for JPEG artifacts on game assets.
+        flat_areas_x = np.mean(dx < 15.0 / 255.0)
+        flat_areas_y = np.mean(dy < 15.0 / 255.0)
+        flatness = (flat_areas_x + flat_areas_y) / 2.0
+
+        # Combining robust indicators (effective_colors penalized less to support complex RPG tiles)
+        color_score = max(0.0, 1.0 - (effective_colors / 200.0) ** 0.5)
+        quant_score = float(color_score * 0.2 + block_score * 0.5 + flatness * 0.3)
 
         # Complexity as continuous field
         colors_norm = min(len(unique) / 100, 1.0)
@@ -349,7 +387,7 @@ class RouterStage(PipelineStage):
         "pixel_art": {
             "resize_method": Image.Resampling.NEAREST,
             "quantize_method": "exact",
-            "cleanup": "none",
+            "cleanup": "smart",  # changed from 'none' to 'smart' to allow self-cleaning of JPEG noise
             "detail_preserve": "high",
             "n_colors": "auto_low",
             "use_lab": False,
@@ -386,6 +424,16 @@ class RouterStage(PipelineStage):
             "path_opt": True,
             "description": "Hybrid — auto-detect per region",
         },
+        "exact_trace": {
+            "resize_method": Image.Resampling.NEAREST,
+            "quantize_method": "fast_pil",
+            "cleanup": "none",
+            "detail_preserve": "exact",
+            "n_colors": "auto_exact",
+            "use_lab": False,
+            "path_opt": True,
+            "description": "Exact Trace — bypass downsizing and accurately trace image at native size",
+        },
     }
 
     def run(self, ctx: PipelineContext) -> None:
@@ -403,9 +451,9 @@ class RouterStage(PipelineStage):
 
         # Continuous scoring (not discrete 0/1)
         pa_score = (
-            a.get("quantization_score", 0) * 3.0 +
+            a.get("quantization_score", 0) * 4.0 +
             (2.0 if a.get("has_outline") else 0.0) +
-            max(0.0, (4.0 - a.get("color_entropy", 10)) / 4.0 * 2.0) +
+            max(0.0, (9.0 - a.get("color_entropy", 10)) / 9.0 * 1.0) +
             min(1.0, a.get("edge_density", 0) / 0.1)
         )
         v_score = (
@@ -424,6 +472,7 @@ class RouterStage(PipelineStage):
             "vector_approx": v_score,
             "photo_simplified": ph_score,
             "hybrid": 1.0,  # baseline
+            "exact_trace": 1.5,  # Slightly favored baseline fallback if requested or forced by args
         }
 
         best = max(scores, key=scores.get)
@@ -469,7 +518,7 @@ class CropStage(PipelineStage):
         self.padding = padding
 
     def run(self, ctx: PipelineContext) -> None:
-        if not ctx.user_params.get("crop_content", True):
+        if not ctx.user_params.get("crop_content", True) or ctx.strategy_name == "exact_trace":
             return
         img = ctx.image
         assert img is not None
@@ -508,19 +557,75 @@ class GridSizeStage(PipelineStage):
                 ctx.metadata["grid_size"] = (int(user_gs[0]), int(user_gs[1]))
             return
 
-        if max_dim:
+        # Adaptive Grid Size via Edge Frequency
+        arr_f = ctx.arr.astype(np.float64)
+        dx = np.sum(np.abs(arr_f[:, 1:, :3] - arr_f[:, :-1, :3]), axis=2)
+        dy = np.sum(np.abs(arr_f[1:, :, :3] - arr_f[:-1, :, :3]), axis=2)
+
+        sum_dx = np.sum(dx, axis=0)
+        sum_dy = np.sum(dy, axis=1)
+
+        # Adaptive Grid Size via Shifted Difference (Autocorrelation-like)
+        # Finds the exact upscaling factor / pixel block size more reliably than simple peak detection
+        def find_period(arr1d, max_shift=64):
+            errors = []
+            max_s = min(max_shift, len(arr1d) // 2)
+            if max_s < 2: return 0.0
+            for shift in range(1, max_s):
+                err = np.mean(np.abs(arr1d[shift:] - arr1d[:-shift]))
+                errors.append((shift, err))
+
+            # Find local minima in error
+            minima = []
+            for i in range(1, len(errors)-1):
+                if errors[i][1] < errors[i-1][1] and errors[i][1] < errors[i+1][1]:
+                    minima.append(errors[i])
+
+            if not minima:
+                return 0.0
+
+            minima.sort(key=lambda x: x[1])
+            # The true scale is usually the first strong minimum.
+            return float(minima[0][0])
+
+        scale_x = find_period(sum_dx)
+        scale_y = find_period(sum_dy)
+
+        # Continuous fallback if signal is too weak
+        if scale_x == 0 and scale_y == 0:
+            scale = max(1.0, min(w, h) / 48.0)
+        else:
+            scale = max(1.0, (scale_x + scale_y) / 2.0 if scale_x and scale_y else (scale_x or scale_y))
+
+        # If it's a known pixel art image but very noisy, strict scaling helps grid alignment
+        scale = np.round(scale) # Snap scale to exact integer to fix "line keluar" misalignment on JPEGs
+        scale = max(2.0, min(scale, min(w, h) / 8.0))
+
+        # For pixel art with non-perfect cropped boundaries (e.g. 554 pixels / 9 scale = 61.5 blocks)
+        # We must truncate (floor), not round, to avoid inventing a block out of a thin 5px border
+        if ctx.strategy_name == "pixel_art":
+            auto_gs = (max(1, int(w // scale)), max(1, int(h // scale)))
+        else:
+            auto_gs = (max(1, int(round(w / scale))), max(1, int(round(h / scale))))
+
+        if ctx.strategy_name == "exact_trace":
+            # Exact trace preserves full resolution, bypassing downscaling
+            gs = (w, h)
+            scale = 1.0
+        elif max_dim:
             aspect = w / h if h else 1
             if aspect >= 1:
                 gs = (max_dim, max(1, int(round(max_dim / aspect))))
             else:
                 gs = (max(1, int(round(max_dim * aspect))), max_dim)
-        elif a.get("quantization_score", 0) > 0.7:
-            scale = max(8, min(16, int(round(min(w, h) / 32))))
-            gs = (max(1, w // scale), max(1, h // scale))
+        elif a.get("quantization_score", 0) > 0.4:
+            gs = auto_gs
         else:
-            scale = max(w, h) / 48
+            scale = max(w, h) / 48.0
             gs = (max(1, int(round(w / scale))), max(1, int(round(h / scale))))
+
         ctx.metadata["grid_size"] = gs
+        ctx.metadata["auto_scale"] = scale
 
 
 class ResizeStage(PipelineStage):
@@ -528,9 +633,72 @@ class ResizeStage(PipelineStage):
         img = ctx.image
         assert img is not None
         gw, gh = ctx.metadata["grid_size"]
-        method = ctx.strategy_config.get("resize_method", Image.Resampling.NEAREST)
-        ctx.image = img.resize((gw, gh), method)
-        ctx.arr = np.array(ctx.image.convert("RGBA"))
+
+        # For pixel art, standard resampling (even NEAREST) is mathematically flawed
+        # when dealing with lossy JPEG compression because it samples a single skewed point
+        # or interpolates noise. Instead, we use Block Majority Voting.
+        if ctx.strategy_name == "pixel_art" and (gw, gh) != img.size:
+            arr_orig = np.array(img.convert("RGBA"))
+            h_orig, w_orig, _ = arr_orig.shape
+            scale_x = w_orig / gw
+            scale_y = h_orig / gh
+
+            # To handle severe JPEG noise, we need aggressive clustering before voting.
+            # Instead of naive truncation which splits colors, we use K-Means to find
+            # the dominant colors in the *entire image first*, then snap all pixels to
+            # those colors before downsampling.
+            pixels_flat = arr_orig[:, :, :3].reshape(-1, 3).astype(np.float32)
+
+            import cv2
+            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.2)
+            # Estimate max colors based on image complexity, usually < 16 for clean pixel art
+            K = 16
+            _, labels, centers = cv2.kmeans(pixels_flat, K, None, criteria, 10, cv2.KMEANS_PP_CENTERS)
+            centers = np.uint8(centers)
+            snapped_pixels = centers[labels.flatten()]
+
+            snapped_arr = np.zeros_like(arr_orig)
+            snapped_arr[:, :, :3] = snapped_pixels.reshape(h_orig, w_orig, 3)
+            snapped_arr[:, :, 3] = arr_orig[:, :, 3]
+
+            out = np.zeros((gh, gw, 4), dtype=np.uint8)
+
+            for gy in range(gh):
+                for gx in range(gw):
+                    sx = int(gx * scale_x)
+                    sy = int(gy * scale_y)
+                    ex = int((gx + 1) * scale_x)
+                    ey = int((gy + 1) * scale_y)
+
+                    ex = max(sx + 1, ex)
+                    ey = max(sy + 1, ey)
+
+                    # Center crop to avoid sub-pixel edge overlap. If the block is 9x9 pixels,
+                    # we ignore the outer borders and only sample the dead center of the block.
+                    # This makes the mapping completely immune to border anti-aliasing and grid drift.
+                    margin_x = max(0, int((ex - sx) * 0.25))
+                    margin_y = max(0, int((ey - sy) * 0.25))
+
+                    csx = sx + margin_x
+                    cex = ex - margin_x
+                    csy = sy + margin_y
+                    cey = ey - margin_y
+
+                    # Fallback if too small
+                    if cex <= csx: cex = csx + 1
+                    if cey <= csy: cey = csy + 1
+
+                    block = snapped_arr[csy:cey, csx:cex].reshape(-1, 4)
+                    unique, counts = np.unique(block, axis=0, return_counts=True)
+                    majority_color = unique[np.argmax(counts)]
+                    out[gy, gx] = majority_color
+
+            ctx.image = Image.fromarray(out)
+            ctx.arr = out
+        else:
+            method = ctx.strategy_config.get("resize_method", Image.Resampling.NEAREST)
+            ctx.image = img.resize((gw, gh), method)
+            ctx.arr = np.array(ctx.image.convert("RGBA"))
 
 
 class QuantizeStage(PipelineStage):
@@ -561,7 +729,15 @@ class QuantizeStage(PipelineStage):
         nc = self._resolve_n_colors(ctx)
 
         qm = ctx.strategy_config.get("quantize_method", "exact")
-        if qm == "exact":
+
+        # If fast_pil is selected (e.g., for full-resolution tracing where k-means is too slow), bypass custom implementations
+        if qm == "fast_pil":
+            pil_img = ctx.image.convert("RGB")
+            # Quantize using PIL's fast native method
+            q_img = pil_img.quantize(colors=nc, method=Image.Quantize.MAXCOVERAGE)
+            raw_pal = q_img.getpalette()[:nc*3]
+            palette = [tuple(raw_pal[i:i+3]) for i in range(0, len(raw_pal), 3)]
+        elif qm == "exact":
             palette = self._quantize_exact(pixels, nc)
         elif qm == "kmeans_rich":
             palette = self._quantize_kmeans(pixels, nc, use_lab)
@@ -584,8 +760,18 @@ class QuantizeStage(PipelineStage):
         ctx.color_map = {i + 1: rgb_to_hex(p) for i, p in enumerate(ctx.palette)}
         ctx.metadata["n_colors"] = len(ctx.palette)
 
-        # Quantize grid (perceptual)
-        ctx.grid = self._quantize_grid(arr, ctx.palette, use_lab, ctx)
+        # Quantize grid
+        if qm == "fast_pil":
+            q_img_arr = np.array(q_img)
+            # PIL quantization returns indices mapped to its own palette order.
+            # We must map these back to our 1-based palette index.
+            ctx.grid = q_img_arr + 1
+            # If there was an alpha channel, mask out background
+            if ctx.user_params.get("remove_background", True):
+                alpha = arr[:, :, 3]
+                ctx.grid[alpha <= 50] = 0
+        else:
+            ctx.grid = self._quantize_grid(arr, ctx.palette, use_lab, ctx)
 
     def _resolve_n_colors(self, ctx: PipelineContext) -> int:
         if isinstance(self.n_colors, int):
@@ -604,16 +790,41 @@ class QuantizeStage(PipelineStage):
             return min(32, max(16, int(uc // 3)))
         elif nc_cfg == "auto_medium":
             return min(24, max(8, int(uc // 4)))
+        elif nc_cfg == "auto_exact":
+            # For exact_trace, allow a larger palette to maintain color fidelity
+            return min(256, max(32, int(uc // 2)))
         else:
-            if a.get("quantization_score", 0) > 0.7:
-                return max(4, min(20, int(uc)))
+            if a.get("quantization_score", 0) > 0.4:
+                # User preference: stepped colors (6 > 16 > 20)
+                if uc <= 10: return 6
+                elif uc <= 24: return 16
+                return 20
             return min(24, max(8, int(uc // 3)))
 
     def _quantize_exact(self, pixels: np.ndarray, n: int) -> List[Tuple[int, int, int]]:
-        rounded = (pixels // 16) * 16
-        unique, counts = np.unique(rounded, axis=0, return_counts=True)
-        top_idx = np.argsort(counts)[-n:]
-        palette = [tuple(map(int, unique[i])) for i in top_idx]
+        # For pixel art with JPEG noise, naive rounding (// 16) is destructive as it splits
+        # similar colors across arbitrary 16-boundaries. Instead, we use greedy distance clustering
+        # to ensure tight groups are merged into single colors.
+        unique_colors, counts = np.unique(pixels, axis=0, return_counts=True)
+        sorted_indices = np.argsort(counts)[::-1]
+        unique_colors = unique_colors[sorted_indices]
+
+        merged_palette = []
+        # Aggressive threshold for pixel art to snap subtle JPEG variations into solid blocks
+        threshold = 25.0
+
+        for color in unique_colors:
+            if len(merged_palette) == 0:
+                merged_palette.append(color)
+            else:
+                # Check distance against already established dominant colors
+                dists = np.linalg.norm(np.array(merged_palette) - color, axis=1)
+                if np.min(dists) > threshold:
+                    merged_palette.append(color)
+            if len(merged_palette) >= n:
+                break
+
+        palette = [tuple(map(int, c)) for c in merged_palette]
         lum = [0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2] for c in palette]
         return [p for _, p in sorted(zip(lum, palette))]
 
@@ -749,31 +960,127 @@ class CleanupStage(PipelineStage):
         if mode == "none":
             return
 
-        min_n = 1 if mode == "light" else (2 if mode == "heavy" else 0)
-        cleaned = grid.copy()
+        # For true pixel art architectures, spatial cleanup often destroys hard structures (like doors/windows).
+        # We must disable destructive cleanup by default for pixel art strategies to avoid "melting".
+        if ctx.strategy_name == "pixel_art":
+            return
 
-        for y in range(h):
-            for x in range(w):
-                if cleaned[y, x] == 0:
-                    continue
-                val = cleaned[y, x]
-                neighbors = 0
-                if y > 0 and cleaned[y - 1, x] == val: neighbors += 1
-                if y < h - 1 and cleaned[y + 1, x] == val: neighbors += 1
-                if x > 0 and cleaned[y, x - 1] == val: neighbors += 1
-                if x < w - 1 and cleaned[y, x + 1] == val: neighbors += 1
-                if neighbors <= min_n:
+        # Dynamic threshold based on analysis. Less cleanup for structured pixel art
+        quant_score = ctx.analysis.get("quantization_score", 0.0)
+        if mode == "smart":
+            # If there's a huge discrepancy between physical unique colors (from JPEG noise)
+            # and what a clean image should have, we force heavy cleanup
+            uc = ctx.analysis.get("unique_colors", 0)
+            if uc > 500:
+                mode = "heavy"
+            elif quant_score > 0.6:
+                mode = "none" # True pixel art needs no cleanup, preserves single pixels
+            elif quant_score > 0.3:
+                mode = "light"
+            else:
+                mode = "heavy"
+
+        if mode == "none":
+            return
+
+        # Structure Evaluation Feedback Loop
+        cleaned = grid.copy()
+        from collections import Counter
+
+        passes = 1 if mode == "light" else (3 if mode == "heavy" else 2)
+        if mode == "smart" and quant_score < 0.5:
+            passes = 3
+
+        for _ in range(passes):
+            new_cleaned = cleaned.copy()
+            for y in range(h):
+                for x in range(w):
+                    if cleaned[y, x] == 0:
+                        continue
+                    val = cleaned[y, x]
+
+                    # Gather 8-connected neighbor colors
                     all_n = []
                     for dy in (-1, 0, 1):
                         for dx in (-1, 0, 1):
                             if dy == 0 and dx == 0:
                                 continue
                             ny, nx = y + dy, x + dx
-                            if 0 <= ny < h and 0 <= nx < w:
+                            if 0 <= ny < h and 0 <= nx < w and cleaned[ny, nx] != 0:
                                 all_n.append(cleaned[ny, nx])
-                    if all(n == 0 for n in all_n):
-                        cleaned[y, x] = 0
+
+                    if not all_n:
+                        continue
+
+                    majority = Counter(all_n).most_common(1)[0][0]
+                    neighbors_same = all_n.count(val)
+
+                    if mode == "heavy" or passes > 1:
+                        # For aggressive merging, we must STILL protect strict pixel-art structures.
+                        direct_n = []
+                        for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                            ny, nx = y + dy, x + dx
+                            if 0 <= ny < h and 0 <= nx < w and cleaned[ny, nx] != 0:
+                                direct_n.append(cleaned[ny, nx])
+
+                        cardinal_same = direct_n.count(val)
+                        if cardinal_same < 2:  # Not part of a straight continuous line
+                            if neighbors_same < 3 and all_n.count(majority) >= 3:
+                                new_cleaned[y, x] = majority
+                    else:
+                        if neighbors_same <= 1 and all_n.count(majority) > len(all_n) // 2:
+                            new_cleaned[y, x] = majority
+            cleaned = new_cleaned
+
         ctx.grid = cleaned
+
+
+class EvaluationStage(PipelineStage):
+    """Evaluates the final grid for structural metrics."""
+
+    def run(self, ctx: PipelineContext) -> None:
+        grid = ctx.grid
+        if grid is None or grid.size == 0:
+            return
+
+        h, w = grid.shape
+
+        # 1. Symmetry
+        mid = w // 2
+        left_half = grid[:, :mid]
+        if w % 2 == 0:
+            right_half_mirrored = grid[:, mid:][:, ::-1]
+        else:
+            right_half_mirrored = grid[:, mid + 1:][:, ::-1]
+
+        symmetry_score = np.mean(left_half == right_half_mirrored)
+
+        # 2. Center of Mass
+        mask = grid > 0
+        if np.sum(mask) == 0:
+            cm_x, cm_y = 0.5, 0.5
+        else:
+            y_coords, x_coords = np.nonzero(mask)
+            cm_y = np.mean(y_coords) / h
+            cm_x = np.mean(x_coords) / w
+
+        # 3. Outline Integrity
+        outline_integrity = 1.0
+        if HAS_SCIPY:
+            struct = ndimage.generate_binary_structure(2, 1)
+            eroded = ndimage.binary_erosion(mask, structure=struct)
+            outline = mask ^ eroded
+
+            if np.sum(outline) > 0:
+                neighbor_count = ndimage.convolve(outline.astype(int), np.ones((3, 3), dtype=int), mode='constant', cval=0) - outline.astype(int)
+                continuous_outline_pixels = np.sum((outline > 0) & (neighbor_count >= 2))
+                outline_integrity = continuous_outline_pixels / np.sum(outline)
+
+        ctx.metadata["structural_evaluation"] = {
+            "symmetry": float(symmetry_score),
+            "center_of_mass": (float(cm_x), float(cm_y)),
+            "outline_integrity": float(outline_integrity)
+        }
 
 
 class OutputStage(PipelineStage):
@@ -805,17 +1112,12 @@ class OutputStage(PipelineStage):
             unique_colors = np.unique(grid[grid > 0])
             total_paths = 0
             for color_idx in unique_colors:
-                mask = (grid == color_idx).astype(np.int32)
-                labels, n_comp = label_connected_components(mask)
+                mask = (grid == color_idx)
                 fill = cmap.get(int(color_idx), "#000000")
-                for comp_id in range(1, n_comp + 1):
-                    polys = extract_contours(labels, comp_id)
-                    if not polys:
-                        continue
-                    d = polygons_to_path(polys, ps, ox, oy)
-                    if d:
-                        svg.add_path(d, fill=fill)
-                        total_paths += 1
+                d = mask_to_svg_paths(mask, ps, ox, oy)
+                if d:
+                    svg.add_path(d, fill=fill)
+                    total_paths += 1
 
             # Heuristic: if too fragmented, suggest rect mode for next run
             if total_paths > len(unique_colors) * 50:
@@ -826,145 +1128,120 @@ class OutputStage(PipelineStage):
 
 
 # ============================================================================
-# CONNECTED COMPONENTS & CONTOURS (Hoshen-Kopelman)
+# CONNECTED COMPONENTS & SVG PATH TRACING
 # ============================================================================
 
-class UnionFind:
-    __slots__ = ("parent", "rank")
+def mask_to_svg_paths(mask: np.ndarray, scale: float, offset_x: float, offset_y: float) -> str:
+    """
+    Given a 2D boolean mask, trace the boundaries to perfectly form a polygon path.
+    Traces the edges of the pixels so that a 1x1 pixel forms a 1x1 square path without gaps.
+    """
+    h, w = mask.shape
 
-    def __init__(self, n: int):
-        self.parent = np.arange(n, dtype=np.int32)
-        self.rank = np.zeros(n, dtype=np.int32)
+    h_edges = np.zeros((h + 1, w), dtype=bool)
+    h_edges[0, :] = mask[0, :]
+    h_edges[-1, :] = mask[-1, :]
+    if h > 1:
+        h_edges[1:-1, :] = mask[:-1, :] ^ mask[1:, :]
 
-    def find(self, x: int) -> int:
-        root = x
-        while self.parent[root] != root:
-            root = self.parent[root]
-        while self.parent[x] != x:
-            nxt = self.parent[x]
-            self.parent[x] = root
-            x = nxt
-        return root
+    v_edges = np.zeros((h, w + 1), dtype=bool)
+    v_edges[:, 0] = mask[:, 0]
+    v_edges[:, -1] = mask[:, -1]
+    if w > 1:
+        v_edges[:, 1:-1] = mask[:, :-1] ^ mask[:, 1:]
 
-    def union(self, x: int, y: int):
-        rx, ry = self.find(x), self.find(y)
-        if rx == ry:
-            return
-        if self.rank[rx] < self.rank[ry]:
-            rx, ry = ry, rx
-        self.parent[ry] = rx
-        if self.rank[rx] == self.rank[ry]:
-            self.rank[rx] += 1
-
-
-def label_connected_components(grid: np.ndarray) -> Tuple[np.ndarray, int]:
-    h, w = grid.shape
-    labels = np.zeros((h, w), dtype=np.int32)
-    uf = UnionFind(h * w)
-    next_label = 1
-
-    for y in range(h):
-        for x in range(w):
-            if grid[y, x] == 0:
-                continue
-            val = grid[y, x]
-            left = labels[y, x - 1] if x > 0 and grid[y, x - 1] == val else 0
-            up = labels[y - 1, x] if y > 0 and grid[y - 1, x] == val else 0
-            if left and up:
-                labels[y, x] = left
-                if left != up:
-                    uf.union(left, up)
-            elif left:
-                labels[y, x] = left
-            elif up:
-                labels[y, x] = up
-            else:
-                labels[y, x] = next_label
-                next_label += 1
-
-    for y in range(h):
-        for x in range(w):
-            if labels[y, x]:
-                labels[y, x] = uf.find(labels[y, x])
-
-    unique = np.unique(labels[labels > 0])
-    remap = {old: new for new, old in enumerate(unique, start=1)}
-    for y in range(h):
-        for x in range(w):
-            if labels[y, x]:
-                labels[y, x] = remap[labels[y, x]]
-
-    return labels, len(unique)
-
-
-def extract_contours(labels: np.ndarray, target_label: int) -> List[List[Tuple[int, int]]]:
-    h, w = labels.shape
-    mask = (labels == target_label).astype(np.uint8)
-    if not np.any(mask):
-        return []
-    padded = np.pad(mask, ((1, 1), (1, 1)), mode="constant")
-    contours = []
-    visited = np.zeros_like(padded, dtype=bool)
-
-    for y in range(1, h + 1):
-        for x in range(1, w + 1):
-            if padded[y, x] and not padded[y, x - 1] and not visited[y, x]:
-                poly = []
-                cx, cy = x, y
-                start = (cx, cy)
-                direction = 0
-                max_steps = (w + 2) * (h + 2) * 4
-                steps = 0
-                while steps < max_steps:
-                    steps += 1
-                    poly.append((cx - 1, cy - 1))
-                    visited[cy, cx] = True
-                    found = False
-                    for turn in [3, 0, 1, 2]:
-                        nd = (direction + turn) % 4
-                        dx, dy = [(1, 0), (0, 1), (-1, 0), (0, -1)][nd]
-                        nx, ny = cx + dx, cy + dy
-                        if 0 <= nx < w + 2 and 0 <= ny < h + 2:
-                            if padded[ny, nx]:
-                                dx_edge, dy_edge = [(0, -1), (-1, 0), (0, 1), (1, 0)][nd]
-                                lx, ly = nx + dx_edge, ny + dy_edge
-                                if 0 <= lx < w + 2 and 0 <= ly < h + 2 and not padded[ly, lx]:
-                                    direction = nd
-                                    cx, cy = nx, ny
-                                    found = True
-                                    break
-                                elif not padded[ny, nx - 1] and nd == 0:
-                                    direction = nd
-                                    cx, cy = nx, ny
-                                    found = True
-                                    break
-                    if not found or (cx, cy) == start and len(poly) > 2:
-                        break
-                if len(poly) > 2:
-                    contours.append(poly)
-    return contours
-
-
-def polygons_to_path(polygons, scale, offset_x, offset_y):
     parts = []
-    for poly in polygons:
-        if not poly:
-            continue
-        simplified = [poly[0]]
-        for i in range(1, len(poly) - 1):
-            p0, p1, p2 = poly[i - 1], poly[i], poly[i + 1]
-            cross = (p1[0] - p0[0]) * (p2[1] - p1[1]) - (p1[1] - p0[1]) * (p2[0] - p1[0])
-            if cross != 0:
-                simplified.append(p1)
-        if len(poly) > 1:
-            simplified.append(poly[-1])
-        if len(simplified) < 2:
-            continue
-        cmds = [f"M {simplified[0][0] * scale + offset_x:.2f} {simplified[0][1] * scale + offset_y:.2f}"]
-        for p in simplified[1:]:
-            cmds.append(f"L {p[0] * scale + offset_x:.2f} {p[1] * scale + offset_y:.2f}")
-        cmds.append("Z")
-        parts.append(" ".join(cmds))
+    used_h = np.zeros_like(h_edges)
+    used_v = np.zeros_like(v_edges)
+
+    while True:
+        start_y, start_x = -1, -1
+        for y in range(h + 1):
+            for x in range(w):
+                if h_edges[y, x] and not used_h[y, x]:
+                    start_y, start_x = y, x
+                    break
+            if start_y != -1: break
+
+        if start_y == -1: break
+
+        cy, cx = start_y, start_x
+        if start_y < h and mask[start_y, start_x]:
+            direction = 'R'
+        else:
+            direction = 'L'
+            cx += 1
+
+        poly = [(cx, cy)]
+
+        while True:
+            if direction == 'R':
+                used_h[cy, cx] = True
+                cx += 1
+                poly.append((cx, cy))
+                if cy < h and v_edges[cy, cx] and not used_v[cy, cx]:
+                    direction = 'D'
+                elif cx < w and h_edges[cy, cx] and not used_h[cy, cx]:
+                    direction = 'R'
+                elif cy > 0 and v_edges[cy-1, cx] and not used_v[cy-1, cx]:
+                    direction = 'U'
+                    cy -= 1
+                else:
+                    break
+            elif direction == 'L':
+                cx -= 1
+                used_h[cy, cx] = True
+                poly.append((cx, cy))
+                if cy > 0 and v_edges[cy-1, cx] and not used_v[cy-1, cx]:
+                    direction = 'U'
+                    cy -= 1
+                elif cx > 0 and h_edges[cy, cx-1] and not used_h[cy, cx-1]:
+                    direction = 'L'
+                elif cy < h and v_edges[cy, cx] and not used_v[cy, cx]:
+                    direction = 'D'
+                else:
+                    break
+            elif direction == 'D':
+                used_v[cy, cx] = True
+                cy += 1
+                poly.append((cx, cy))
+                if cx > 0 and h_edges[cy, cx-1] and not used_h[cy, cx-1]:
+                    direction = 'L'
+                elif cy < h and v_edges[cy, cx] and not used_v[cy, cx]:
+                    direction = 'D'
+                elif cx < w and h_edges[cy, cx] and not used_h[cy, cx]:
+                    direction = 'R'
+                else:
+                    break
+            elif direction == 'U':
+                used_v[cy, cx] = True
+                poly.append((cx, cy))
+                if cx < w and h_edges[cy, cx] and not used_h[cy, cx]:
+                    direction = 'R'
+                elif cy > 0 and v_edges[cy-1, cx] and not used_v[cy-1, cx]:
+                    direction = 'U'
+                    cy -= 1
+                elif cx > 0 and h_edges[cy, cx-1] and not used_h[cy, cx-1]:
+                    direction = 'L'
+                else:
+                    break
+
+        if len(poly) > 2:
+            simp = [poly[0]]
+            for i in range(1, len(poly)-1):
+                p0, p1, p2 = poly[i-1], poly[i], poly[i+1]
+                if not ((p0[0] == p1[0] == p2[0]) or (p0[1] == p1[1] == p2[1])):
+                    simp.append(p1)
+            simp.append(poly[-1])
+
+            # When tracing full resolution exactly, we prefer straight lines to avoid drifting from original shape
+            cmds = [f"M {simp[0][0]*scale + offset_x:.2f} {simp[0][1]*scale + offset_y:.2f}"]
+            for p in simp[1:]:
+                cmds.append(f"L {p[0]*scale + offset_x:.2f} {p[1]*scale + offset_y:.2f}")
+            cmds.append("Z")
+
+            parts.append(" ".join(cmds))
+
     return " ".join(parts)
 
 
@@ -1316,16 +1593,11 @@ def grid_to_svg(grid, color_map, pixel_size=16, canvas=None, background="#FFFFFF
     else:
         unique_colors = np.unique(grid_arr[grid_arr > 0])
         for color_idx in unique_colors:
-            mask = (grid_arr == color_idx).astype(np.int32)
-            labels, n_comp = label_connected_components(mask)
+            mask = (grid_arr == color_idx)
             fill = color_map.get(int(color_idx), "#000000")
-            for comp_id in range(1, n_comp + 1):
-                polys = extract_contours(labels, comp_id)
-                if not polys:
-                    continue
-                d = polygons_to_path(polys, pixel_size, ox, oy)
-                if d:
-                    svg.add_path(d, fill=fill)
+            d = mask_to_svg_paths(mask, pixel_size, ox, oy)
+            if d:
+                svg.add_path(d, fill=fill)
     return svg.to_string()
 
 
@@ -1476,6 +1748,9 @@ def _cli_convert(args):
     print(f"✓ Converted: {args.input} -> {args.output}")
     print(f"  Strategy: {meta.get('strategy_name', '?')} (confidence: {meta.get('strategy_confidence', 0):.0%})")
     print(f"  Grid: {meta['grid_size']}, Colors: {meta['n_colors']}")
+    if "structural_evaluation" in meta:
+        struct = meta["structural_evaluation"]
+        print(f"  Structure: symmetry={struct['symmetry']:.2f}, cm=({struct['center_of_mass'][0]:.2f}, {struct['center_of_mass'][1]:.2f}), outline={struct['outline_integrity']:.2f}")
     print(f"  SVG mode: {'path-based' if use_paths else 'rect-optimized'}")
     print(f"  Time: {dt:.2f}s")
 
@@ -1529,7 +1804,7 @@ def main():
     p_conv.add_argument("output", help="Output SVG path")
     p_conv.add_argument("--grid-size", default="auto", help="Grid size: auto, N, or WxH")
     p_conv.add_argument("--colors", default="auto", help="Number of colors (auto or int)")
-    p_conv.add_argument("--strategy", choices=["pixel_art", "vector_approx", "photo_simplified", "hybrid"], help="Force strategy")
+    p_conv.add_argument("--strategy", choices=["pixel_art", "vector_approx", "photo_simplified", "hybrid", "exact_trace"], help="Force strategy")
     p_conv.add_argument("--palette-hint", nargs="+", help="Hex color hints")
     p_conv.add_argument("--detail", choices=["high", "medium", "low", "adaptive"], help="Detail preservation")
     p_conv.add_argument("--cleanup", choices=["none", "light", "heavy", "smart"], help="Cleanup mode")
