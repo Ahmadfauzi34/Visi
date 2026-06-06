@@ -303,9 +303,28 @@ class AnalysisStage(PipelineStage):
         lum = 0.299 * pixels[:, 0] + 0.587 * pixels[:, 1] + 0.114 * pixels[:, 2]
         has_outline = bool(np.sum(lum < 50) / len(pixels) > 0.05)
 
-        # Continuous quantization score (0-1), not boolean
-        total_pixels = w * h
-        quant_score = 1.0 - min(1.0, len(unique) / max(50, total_pixels / 500))
+        # Continuous quantization score via cumulative color frequency (robust to noise)
+        sorted_counts = np.sort(counts)[::-1]
+        cumulative = np.cumsum(sorted_counts) / counts.sum()
+        # Number of colors needed to represent 95% of the image
+        effective_colors = np.searchsorted(cumulative, 0.95) + 1
+
+        # Also check gradient sparsity (sharpness)
+        arr_f = arr.astype(np.float64) / 255.0
+        dx = np.sum(np.abs(arr_f[:, 1:] - arr_f[:, :-1]), axis=2)
+        dy = np.sum(np.abs(arr_f[1:, :] - arr_f[:-1, :]), axis=2)
+        total_grad = np.sum(dx) + np.sum(dy)
+        sharp_grad = np.sum(dx[dx > 0.2]) + np.sum(dy[dy > 0.2])
+        grad_sparsity = sharp_grad / total_grad if total_grad > 0 else 0.0
+
+        # Measure flat areas (characteristic of pixel art/highly quantized images)
+        flat_areas_x = np.mean(dx < 5.0 / 255.0)
+        flat_areas_y = np.mean(dy < 5.0 / 255.0)
+        flatness = (flat_areas_x + flat_areas_y) / 2.0
+
+        # High grad sparsity + low effective colors + high flatness = high quant score (pixel art)
+        color_score = 1.0 - min(1.0, (effective_colors / 100.0) ** 0.5)
+        quant_score = float(color_score * 0.3 + grad_sparsity * 0.3 + flatness * 0.4)
 
         # Complexity as continuous field
         colors_norm = min(len(unique) / 100, 1.0)
@@ -508,19 +527,55 @@ class GridSizeStage(PipelineStage):
                 ctx.metadata["grid_size"] = (int(user_gs[0]), int(user_gs[1]))
             return
 
+        # Adaptive Grid Size via Edge Frequency
+        arr_f = ctx.arr.astype(np.float64)
+        dx = np.sum(np.abs(arr_f[:, 1:, :3] - arr_f[:, :-1, :3]), axis=2)
+        dy = np.sum(np.abs(arr_f[1:, :, :3] - arr_f[:-1, :, :3]), axis=2)
+
+        sum_dx = np.sum(dx, axis=0)
+        sum_dy = np.sum(dy, axis=1)
+
+        peaks_x = np.where(sum_dx > np.mean(sum_dx) * 1.5)[0]
+        peaks_y = np.where(sum_dy > np.mean(sum_dy) * 1.5)[0]
+
+        def extract_scale(peaks):
+            if len(peaks) < 2: return 0.0
+            diffs = np.diff(peaks)
+            valid = diffs[diffs >= 3]
+            if len(valid) == 0: return 0.0
+            unique, counts = np.unique(valid, return_counts=True)
+            best_diff = unique[np.argmax(counts)]
+            close = valid[np.abs(valid - best_diff) <= 1]
+            return float(np.mean(close)) if len(close) > 0 else float(best_diff)
+
+        scale_x = extract_scale(peaks_x)
+        scale_y = extract_scale(peaks_y)
+
+        # Continuous fallback if signal is too weak
+        if scale_x == 0 and scale_y == 0:
+            scale = max(1.0, min(w, h) / 48.0)
+        else:
+            scale = max(1.0, (scale_x + scale_y) / 2.0 if scale_x and scale_y else (scale_x or scale_y))
+
+        # Constrain scale to avoid exploding memory or losing structure
+        scale = max(2.0, min(scale, min(w, h) / 8.0))
+
+        auto_gs = (max(1, int(round(w / scale))), max(1, int(round(h / scale))))
+
         if max_dim:
             aspect = w / h if h else 1
             if aspect >= 1:
                 gs = (max_dim, max(1, int(round(max_dim / aspect))))
             else:
                 gs = (max(1, int(round(max_dim * aspect))), max_dim)
-        elif a.get("quantization_score", 0) > 0.7:
-            scale = max(8, min(16, int(round(min(w, h) / 32))))
-            gs = (max(1, w // scale), max(1, h // scale))
+        elif a.get("quantization_score", 0) > 0.4:
+            gs = auto_gs
         else:
-            scale = max(w, h) / 48
+            scale = max(w, h) / 48.0
             gs = (max(1, int(round(w / scale))), max(1, int(round(h / scale))))
+
         ctx.metadata["grid_size"] = gs
+        ctx.metadata["auto_scale"] = scale
 
 
 class ResizeStage(PipelineStage):
@@ -749,30 +804,57 @@ class CleanupStage(PipelineStage):
         if mode == "none":
             return
 
-        min_n = 1 if mode == "light" else (2 if mode == "heavy" else 0)
+        # Dynamic threshold based on analysis. Less cleanup for structured pixel art
+        quant_score = ctx.analysis.get("quantization_score", 0.0)
+        if mode == "smart":
+            if quant_score > 0.6:
+                mode = "none" # True pixel art needs no cleanup, preserves single pixels
+            elif quant_score > 0.3:
+                mode = "light"
+            else:
+                mode = "heavy"
+
+        if mode == "none":
+            return
+
+        min_n = 1 if mode == "light" else 2
         cleaned = grid.copy()
 
+        # We replace isolated pixels with the majority color of their neighbors,
+        # instead of just setting them to 0 (which punches holes).
         for y in range(h):
             for x in range(w):
                 if cleaned[y, x] == 0:
                     continue
                 val = cleaned[y, x]
-                neighbors = 0
-                if y > 0 and cleaned[y - 1, x] == val: neighbors += 1
-                if y < h - 1 and cleaned[y + 1, x] == val: neighbors += 1
-                if x > 0 and cleaned[y, x - 1] == val: neighbors += 1
-                if x < w - 1 and cleaned[y, x + 1] == val: neighbors += 1
-                if neighbors <= min_n:
+
+                # Check 4-connected neighbors of same color
+                neighbors_same = 0
+                if y > 0 and cleaned[y - 1, x] == val: neighbors_same += 1
+                if y < h - 1 and cleaned[y + 1, x] == val: neighbors_same += 1
+                if x > 0 and cleaned[y, x - 1] == val: neighbors_same += 1
+                if x < w - 1 and cleaned[y, x + 1] == val: neighbors_same += 1
+
+                if neighbors_same <= min_n:
+                    # Gather 8-connected neighbor colors to find majority
                     all_n = []
                     for dy in (-1, 0, 1):
                         for dx in (-1, 0, 1):
                             if dy == 0 and dx == 0:
                                 continue
                             ny, nx = y + dy, x + dx
-                            if 0 <= ny < h and 0 <= nx < w:
+                            if 0 <= ny < h and 0 <= nx < w and cleaned[ny, nx] != 0:
                                 all_n.append(cleaned[ny, nx])
-                    if all(n == 0 for n in all_n):
+
+                    if not all_n:
                         cleaned[y, x] = 0
+                    else:
+                        from collections import Counter
+                        majority = Counter(all_n).most_common(1)[0][0]
+                        # Only replace if majority is strong enough
+                        if all_n.count(majority) > len(all_n) // 2:
+                            cleaned[y, x] = majority
+
         ctx.grid = cleaned
 
 
@@ -805,17 +887,12 @@ class OutputStage(PipelineStage):
             unique_colors = np.unique(grid[grid > 0])
             total_paths = 0
             for color_idx in unique_colors:
-                mask = (grid == color_idx).astype(np.int32)
-                labels, n_comp = label_connected_components(mask)
+                mask = (grid == color_idx)
                 fill = cmap.get(int(color_idx), "#000000")
-                for comp_id in range(1, n_comp + 1):
-                    polys = extract_contours(labels, comp_id)
-                    if not polys:
-                        continue
-                    d = polygons_to_path(polys, ps, ox, oy)
-                    if d:
-                        svg.add_path(d, fill=fill)
-                        total_paths += 1
+                d = mask_to_svg_paths(mask, ps, ox, oy)
+                if d:
+                    svg.add_path(d, fill=fill)
+                    total_paths += 1
 
             # Heuristic: if too fragmented, suggest rect mode for next run
             if total_paths > len(unique_colors) * 50:
@@ -826,145 +903,118 @@ class OutputStage(PipelineStage):
 
 
 # ============================================================================
-# CONNECTED COMPONENTS & CONTOURS (Hoshen-Kopelman)
+# CONNECTED COMPONENTS & SVG PATH TRACING
 # ============================================================================
 
-class UnionFind:
-    __slots__ = ("parent", "rank")
+def mask_to_svg_paths(mask: np.ndarray, scale: float, offset_x: float, offset_y: float) -> str:
+    """
+    Given a 2D boolean mask, trace the boundaries to perfectly form a polygon path.
+    Traces the edges of the pixels so that a 1x1 pixel forms a 1x1 square path without gaps.
+    """
+    h, w = mask.shape
 
-    def __init__(self, n: int):
-        self.parent = np.arange(n, dtype=np.int32)
-        self.rank = np.zeros(n, dtype=np.int32)
+    h_edges = np.zeros((h + 1, w), dtype=bool)
+    h_edges[0, :] = mask[0, :]
+    h_edges[-1, :] = mask[-1, :]
+    if h > 1:
+        h_edges[1:-1, :] = mask[:-1, :] ^ mask[1:, :]
 
-    def find(self, x: int) -> int:
-        root = x
-        while self.parent[root] != root:
-            root = self.parent[root]
-        while self.parent[x] != x:
-            nxt = self.parent[x]
-            self.parent[x] = root
-            x = nxt
-        return root
+    v_edges = np.zeros((h, w + 1), dtype=bool)
+    v_edges[:, 0] = mask[:, 0]
+    v_edges[:, -1] = mask[:, -1]
+    if w > 1:
+        v_edges[:, 1:-1] = mask[:, :-1] ^ mask[:, 1:]
 
-    def union(self, x: int, y: int):
-        rx, ry = self.find(x), self.find(y)
-        if rx == ry:
-            return
-        if self.rank[rx] < self.rank[ry]:
-            rx, ry = ry, rx
-        self.parent[ry] = rx
-        if self.rank[rx] == self.rank[ry]:
-            self.rank[rx] += 1
-
-
-def label_connected_components(grid: np.ndarray) -> Tuple[np.ndarray, int]:
-    h, w = grid.shape
-    labels = np.zeros((h, w), dtype=np.int32)
-    uf = UnionFind(h * w)
-    next_label = 1
-
-    for y in range(h):
-        for x in range(w):
-            if grid[y, x] == 0:
-                continue
-            val = grid[y, x]
-            left = labels[y, x - 1] if x > 0 and grid[y, x - 1] == val else 0
-            up = labels[y - 1, x] if y > 0 and grid[y - 1, x] == val else 0
-            if left and up:
-                labels[y, x] = left
-                if left != up:
-                    uf.union(left, up)
-            elif left:
-                labels[y, x] = left
-            elif up:
-                labels[y, x] = up
-            else:
-                labels[y, x] = next_label
-                next_label += 1
-
-    for y in range(h):
-        for x in range(w):
-            if labels[y, x]:
-                labels[y, x] = uf.find(labels[y, x])
-
-    unique = np.unique(labels[labels > 0])
-    remap = {old: new for new, old in enumerate(unique, start=1)}
-    for y in range(h):
-        for x in range(w):
-            if labels[y, x]:
-                labels[y, x] = remap[labels[y, x]]
-
-    return labels, len(unique)
-
-
-def extract_contours(labels: np.ndarray, target_label: int) -> List[List[Tuple[int, int]]]:
-    h, w = labels.shape
-    mask = (labels == target_label).astype(np.uint8)
-    if not np.any(mask):
-        return []
-    padded = np.pad(mask, ((1, 1), (1, 1)), mode="constant")
-    contours = []
-    visited = np.zeros_like(padded, dtype=bool)
-
-    for y in range(1, h + 1):
-        for x in range(1, w + 1):
-            if padded[y, x] and not padded[y, x - 1] and not visited[y, x]:
-                poly = []
-                cx, cy = x, y
-                start = (cx, cy)
-                direction = 0
-                max_steps = (w + 2) * (h + 2) * 4
-                steps = 0
-                while steps < max_steps:
-                    steps += 1
-                    poly.append((cx - 1, cy - 1))
-                    visited[cy, cx] = True
-                    found = False
-                    for turn in [3, 0, 1, 2]:
-                        nd = (direction + turn) % 4
-                        dx, dy = [(1, 0), (0, 1), (-1, 0), (0, -1)][nd]
-                        nx, ny = cx + dx, cy + dy
-                        if 0 <= nx < w + 2 and 0 <= ny < h + 2:
-                            if padded[ny, nx]:
-                                dx_edge, dy_edge = [(0, -1), (-1, 0), (0, 1), (1, 0)][nd]
-                                lx, ly = nx + dx_edge, ny + dy_edge
-                                if 0 <= lx < w + 2 and 0 <= ly < h + 2 and not padded[ly, lx]:
-                                    direction = nd
-                                    cx, cy = nx, ny
-                                    found = True
-                                    break
-                                elif not padded[ny, nx - 1] and nd == 0:
-                                    direction = nd
-                                    cx, cy = nx, ny
-                                    found = True
-                                    break
-                    if not found or (cx, cy) == start and len(poly) > 2:
-                        break
-                if len(poly) > 2:
-                    contours.append(poly)
-    return contours
-
-
-def polygons_to_path(polygons, scale, offset_x, offset_y):
     parts = []
-    for poly in polygons:
-        if not poly:
-            continue
-        simplified = [poly[0]]
-        for i in range(1, len(poly) - 1):
-            p0, p1, p2 = poly[i - 1], poly[i], poly[i + 1]
-            cross = (p1[0] - p0[0]) * (p2[1] - p1[1]) - (p1[1] - p0[1]) * (p2[0] - p1[0])
-            if cross != 0:
-                simplified.append(p1)
-        if len(poly) > 1:
-            simplified.append(poly[-1])
-        if len(simplified) < 2:
-            continue
-        cmds = [f"M {simplified[0][0] * scale + offset_x:.2f} {simplified[0][1] * scale + offset_y:.2f}"]
-        for p in simplified[1:]:
-            cmds.append(f"L {p[0] * scale + offset_x:.2f} {p[1] * scale + offset_y:.2f}")
-        cmds.append("Z")
-        parts.append(" ".join(cmds))
+    used_h = np.zeros_like(h_edges)
+    used_v = np.zeros_like(v_edges)
+
+    while True:
+        start_y, start_x = -1, -1
+        for y in range(h + 1):
+            for x in range(w):
+                if h_edges[y, x] and not used_h[y, x]:
+                    start_y, start_x = y, x
+                    break
+            if start_y != -1: break
+
+        if start_y == -1: break
+
+        cy, cx = start_y, start_x
+        if start_y < h and mask[start_y, start_x]:
+            direction = 'R'
+        else:
+            direction = 'L'
+            cx += 1
+
+        poly = [(cx, cy)]
+
+        while True:
+            if direction == 'R':
+                used_h[cy, cx] = True
+                cx += 1
+                poly.append((cx, cy))
+                if cy < h and v_edges[cy, cx] and not used_v[cy, cx]:
+                    direction = 'D'
+                elif cx < w and h_edges[cy, cx] and not used_h[cy, cx]:
+                    direction = 'R'
+                elif cy > 0 and v_edges[cy-1, cx] and not used_v[cy-1, cx]:
+                    direction = 'U'
+                    cy -= 1
+                else:
+                    break
+            elif direction == 'L':
+                cx -= 1
+                used_h[cy, cx] = True
+                poly.append((cx, cy))
+                if cy > 0 and v_edges[cy-1, cx] and not used_v[cy-1, cx]:
+                    direction = 'U'
+                    cy -= 1
+                elif cx > 0 and h_edges[cy, cx-1] and not used_h[cy, cx-1]:
+                    direction = 'L'
+                elif cy < h and v_edges[cy, cx] and not used_v[cy, cx]:
+                    direction = 'D'
+                else:
+                    break
+            elif direction == 'D':
+                used_v[cy, cx] = True
+                cy += 1
+                poly.append((cx, cy))
+                if cx > 0 and h_edges[cy, cx-1] and not used_h[cy, cx-1]:
+                    direction = 'L'
+                elif cy < h and v_edges[cy, cx] and not used_v[cy, cx]:
+                    direction = 'D'
+                elif cx < w and h_edges[cy, cx] and not used_h[cy, cx]:
+                    direction = 'R'
+                else:
+                    break
+            elif direction == 'U':
+                used_v[cy, cx] = True
+                poly.append((cx, cy))
+                if cx < w and h_edges[cy, cx] and not used_h[cy, cx]:
+                    direction = 'R'
+                elif cy > 0 and v_edges[cy-1, cx] and not used_v[cy-1, cx]:
+                    direction = 'U'
+                    cy -= 1
+                elif cx > 0 and h_edges[cy, cx-1] and not used_h[cy, cx-1]:
+                    direction = 'L'
+                else:
+                    break
+
+        if len(poly) > 2:
+            simp = [poly[0]]
+            for i in range(1, len(poly)-1):
+                p0, p1, p2 = poly[i-1], poly[i], poly[i+1]
+                if not ((p0[0] == p1[0] == p2[0]) or (p0[1] == p1[1] == p2[1])):
+                    simp.append(p1)
+            simp.append(poly[-1])
+
+            cmds = [f"M {simp[0][0]*scale + offset_x:.2f} {simp[0][1]*scale + offset_y:.2f}"]
+            for p in simp[1:-1]:
+                cmds.append(f"L {p[0]*scale + offset_x:.2f} {p[1]*scale + offset_y:.2f}")
+            cmds.append("Z")
+            parts.append(" ".join(cmds))
+
     return " ".join(parts)
 
 
@@ -1316,16 +1366,11 @@ def grid_to_svg(grid, color_map, pixel_size=16, canvas=None, background="#FFFFFF
     else:
         unique_colors = np.unique(grid_arr[grid_arr > 0])
         for color_idx in unique_colors:
-            mask = (grid_arr == color_idx).astype(np.int32)
-            labels, n_comp = label_connected_components(mask)
+            mask = (grid_arr == color_idx)
             fill = color_map.get(int(color_idx), "#000000")
-            for comp_id in range(1, n_comp + 1):
-                polys = extract_contours(labels, comp_id)
-                if not polys:
-                    continue
-                d = polygons_to_path(polys, pixel_size, ox, oy)
-                if d:
-                    svg.add_path(d, fill=fill)
+            d = mask_to_svg_paths(mask, pixel_size, ox, oy)
+            if d:
+                svg.add_path(d, fill=fill)
     return svg.to_string()
 
 
