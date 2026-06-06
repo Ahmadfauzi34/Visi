@@ -639,8 +639,24 @@ class ResizeStage(PipelineStage):
             scale_x = w_orig / gw
             scale_y = h_orig / gh
 
-            # Pre-round colors to cluster JPEG artifacts before voting
-            rounded = (arr_orig // 32) * 32
+            # To handle severe JPEG noise, we need aggressive clustering before voting.
+            # Instead of naive truncation which splits colors, we use K-Means to find
+            # the dominant colors in the *entire image first*, then snap all pixels to
+            # those colors before downsampling.
+            pixels_flat = arr_orig[:, :, :3].reshape(-1, 3).astype(np.float32)
+
+            import cv2
+            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.2)
+            # Estimate max colors based on image complexity, usually < 16 for clean pixel art
+            K = 16
+            _, labels, centers = cv2.kmeans(pixels_flat, K, None, criteria, 10, cv2.KMEANS_PP_CENTERS)
+            centers = np.uint8(centers)
+            snapped_pixels = centers[labels.flatten()]
+
+            snapped_arr = np.zeros_like(arr_orig)
+            snapped_arr[:, :, :3] = snapped_pixels.reshape(h_orig, w_orig, 3)
+            snapped_arr[:, :, 3] = arr_orig[:, :, 3]
+
             out = np.zeros((gh, gw, 4), dtype=np.uint8)
 
             for gy in range(gh):
@@ -653,7 +669,7 @@ class ResizeStage(PipelineStage):
                     ex = max(sx + 1, ex)
                     ey = max(sy + 1, ey)
 
-                    block = rounded[sy:ey, sx:ex].reshape(-1, 4)
+                    block = snapped_arr[sy:ey, sx:ex].reshape(-1, 4)
                     unique, counts = np.unique(block, axis=0, return_counts=True)
                     majority_color = unique[np.argmax(counts)]
                     out[gy, gx] = majority_color
@@ -767,12 +783,29 @@ class QuantizeStage(PipelineStage):
             return min(24, max(8, int(uc // 3)))
 
     def _quantize_exact(self, pixels: np.ndarray, n: int) -> List[Tuple[int, int, int]]:
-        # If the image was resized using majority voting, the pixels are already heavily clustered.
-        # We round slightly just to merge extremely close edge cases.
-        rounded = (pixels // 16) * 16
-        unique, counts = np.unique(rounded, axis=0, return_counts=True)
-        top_idx = np.argsort(counts)[-n:]
-        palette = [tuple(map(int, unique[i])) for i in top_idx]
+        # For pixel art with JPEG noise, naive rounding (// 16) is destructive as it splits
+        # similar colors across arbitrary 16-boundaries. Instead, we use greedy distance clustering
+        # to ensure tight groups are merged into single colors.
+        unique_colors, counts = np.unique(pixels, axis=0, return_counts=True)
+        sorted_indices = np.argsort(counts)[::-1]
+        unique_colors = unique_colors[sorted_indices]
+
+        merged_palette = []
+        # Aggressive threshold for pixel art to snap subtle JPEG variations into solid blocks
+        threshold = 25.0
+
+        for color in unique_colors:
+            if len(merged_palette) == 0:
+                merged_palette.append(color)
+            else:
+                # Check distance against already established dominant colors
+                dists = np.linalg.norm(np.array(merged_palette) - color, axis=1)
+                if np.min(dists) > threshold:
+                    merged_palette.append(color)
+            if len(merged_palette) >= n:
+                break
+
+        palette = [tuple(map(int, c)) for c in merged_palette]
         lum = [0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2] for c in palette]
         return [p for _, p in sorted(zip(lum, palette))]
 
