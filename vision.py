@@ -554,12 +554,13 @@ class GridSizeStage(PipelineStage):
         def extract_scale(peaks):
             if len(peaks) < 2: return 0.0
             diffs = np.diff(peaks)
-            valid = diffs[diffs >= 3]
+            valid = diffs[diffs >= 2]
             if len(valid) == 0: return 0.0
-            unique, counts = np.unique(valid, return_counts=True)
+            # Stronger snapping to exact integer grid scales to prevent "line keluar" (jagged misalignment)
+            unique, counts = np.unique(np.round(valid), return_counts=True)
             best_diff = unique[np.argmax(counts)]
-            close = valid[np.abs(valid - best_diff) <= 1]
-            return float(np.mean(close)) if len(close) > 0 else float(best_diff)
+            close = valid[np.abs(valid - best_diff) <= 1.5]
+            return float(np.round(np.mean(close))) if len(close) > 0 else float(best_diff)
 
         scale_x = extract_scale(peaks_x)
         scale_y = extract_scale(peaks_y)
@@ -570,8 +571,10 @@ class GridSizeStage(PipelineStage):
         else:
             scale = max(1.0, (scale_x + scale_y) / 2.0 if scale_x and scale_y else (scale_x or scale_y))
 
-        # Constrain scale to avoid exploding memory or losing structure
+        # If it's a known pixel art image but very noisy, strict scaling helps grid alignment
+        scale = np.round(scale) # Snap scale to exact integer to fix "line keluar" misalignment on JPEGs
         scale = max(2.0, min(scale, min(w, h) / 8.0))
+
 
         auto_gs = (max(1, int(round(w / scale))), max(1, int(round(h / scale))))
 
@@ -1025,10 +1028,39 @@ def mask_to_svg_paths(mask: np.ndarray, scale: float, offset_x: float, offset_y:
                     simp.append(p1)
             simp.append(poly[-1])
 
-            cmds = [f"M {simp[0][0]*scale + offset_x:.2f} {simp[0][1]*scale + offset_y:.2f}"]
-            for p in simp[1:-1]:
-                cmds.append(f"L {p[0]*scale + offset_x:.2f} {p[1]*scale + offset_y:.2f}")
-            cmds.append("Z")
+            # Sub-pixel rounding for less "kaku" edges (corner smoothing)
+            cmds = []
+            if len(simp) > 3:
+                # Start midway between simp[0] and simp[1]
+                p0, p1 = simp[0], simp[1]
+                sx, sy = (p0[0] + p1[0])/2 * scale + offset_x, (p0[1] + p1[1])/2 * scale + offset_y
+                cmds.append(f"M {sx:.2f} {sy:.2f}")
+
+                for i in range(1, len(simp)-1):
+                    prev_p, curr_p, next_p = simp[i-1], simp[i], simp[i+1]
+
+                    # Midpoint of the line going into the corner
+                    m1x, m1y = (prev_p[0] + curr_p[0])/2 * scale + offset_x, (prev_p[1] + curr_p[1])/2 * scale + offset_y
+
+                    # The corner itself
+                    cx, cy = curr_p[0] * scale + offset_x, curr_p[1] * scale + offset_y
+
+                    # Midpoint of the line going out of the corner
+                    m2x, m2y = (curr_p[0] + next_p[0])/2 * scale + offset_x, (curr_p[1] + next_p[1])/2 * scale + offset_y
+
+                    cmds.append(f"L {m1x:.2f} {m1y:.2f}")
+                    # Curve around the corner
+                    cmds.append(f"C {cx:.2f} {cy:.2f} {cx:.2f} {cy:.2f} {m2x:.2f} {m2y:.2f}")
+
+                # Close back to start
+                cmds.append(f"L {sx:.2f} {sy:.2f} Z")
+            else:
+                cmds = [f"M {simp[0][0]*scale + offset_x:.2f} {simp[0][1]*scale + offset_y:.2f}"]
+                for p in simp[1:-1]:
+                    ex, ey = p[0]*scale + offset_x, p[1]*scale + offset_y
+                    cmds.append(f"C {ex:.2f} {ey:.2f} {ex:.2f} {ey:.2f} {ex:.2f} {ey:.2f}")
+                cmds.append("Z")
+
             parts.append(" ".join(cmds))
 
     return " ".join(parts)
