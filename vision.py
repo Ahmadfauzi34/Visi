@@ -301,7 +301,7 @@ class AnalysisStage(PipelineStage):
         edge_density = float(np.sum(edges > 30) / edges.size)
 
         lum = 0.299 * pixels[:, 0] + 0.587 * pixels[:, 1] + 0.114 * pixels[:, 2]
-        has_outline = bool(np.sum(lum < 50) / len(pixels) > 0.05)
+        has_outline = bool(np.sum(lum < 75) / len(pixels) > 0.02)
 
         # Continuous quantization score via cumulative color frequency (robust to noise)
         sorted_counts = np.sort(counts)[::-1]
@@ -309,22 +309,35 @@ class AnalysisStage(PipelineStage):
         # Number of colors needed to represent 95% of the image
         effective_colors = np.searchsorted(cumulative, 0.95) + 1
 
-        # Also check gradient sparsity (sharpness)
+        # New color score logic (max 0)
+        color_score = max(0.0, 1.0 - (effective_colors / 200.0) ** 0.5)
+
+        # Also check gradient sparsity and blockiness (sharpness)
         arr_f = arr.astype(np.float64) / 255.0
         dx = np.sum(np.abs(arr_f[:, 1:] - arr_f[:, :-1]), axis=2)
         dy = np.sum(np.abs(arr_f[1:, :] - arr_f[:-1, :]), axis=2)
-        total_grad = np.sum(dx) + np.sum(dy)
-        sharp_grad = np.sum(dx[dx > 0.2]) + np.sum(dy[dy > 0.2])
-        grad_sparsity = sharp_grad / total_grad if total_grad > 0 else 0.0
 
-        # Measure flat areas (characteristic of pixel art/highly quantized images)
-        flat_areas_x = np.mean(dx < 5.0 / 255.0)
-        flat_areas_y = np.mean(dy < 5.0 / 255.0)
+        sum_dx = dx.sum(axis=0)
+        sum_dy = dy.sum(axis=1)
+
+        # Blockiness: variance to mean ratio of grid gradients.
+        # High for scaled pixel art (due to grid lines), low for photos.
+        var_x = np.var(sum_dx) / np.mean(sum_dx) if np.mean(sum_dx) > 0 else 0
+        var_y = np.var(sum_dy) / np.mean(sum_dy) if np.mean(sum_dy) > 0 else 0
+        blockiness = (var_x + var_y) / 2.0
+
+        # Normalize blockiness (typically > 5 for scaled pixel art, < 1 for photos)
+        block_score = min(1.0, blockiness / 10.0)
+
+        # Measure flat areas (characteristic of pixel art/highly quantized images).
+        # Relaxed threshold to 15/255 to account for JPEG artifacts on game assets.
+        flat_areas_x = np.mean(dx < 15.0 / 255.0)
+        flat_areas_y = np.mean(dy < 15.0 / 255.0)
         flatness = (flat_areas_x + flat_areas_y) / 2.0
 
-        # High grad sparsity + low effective colors + high flatness = high quant score (pixel art)
-        color_score = 1.0 - min(1.0, (effective_colors / 100.0) ** 0.5)
-        quant_score = float(color_score * 0.3 + grad_sparsity * 0.3 + flatness * 0.4)
+        # Combining robust indicators (effective_colors penalized less to support complex RPG tiles)
+        color_score = max(0.0, 1.0 - (effective_colors / 200.0) ** 0.5)
+        quant_score = float(color_score * 0.2 + block_score * 0.5 + flatness * 0.3)
 
         # Complexity as continuous field
         colors_norm = min(len(unique) / 100, 1.0)
@@ -422,9 +435,9 @@ class RouterStage(PipelineStage):
 
         # Continuous scoring (not discrete 0/1)
         pa_score = (
-            a.get("quantization_score", 0) * 3.0 +
+            a.get("quantization_score", 0) * 4.0 +
             (2.0 if a.get("has_outline") else 0.0) +
-            max(0.0, (4.0 - a.get("color_entropy", 10)) / 4.0 * 2.0) +
+            max(0.0, (9.0 - a.get("color_entropy", 10)) / 9.0 * 1.0) +
             min(1.0, a.get("edge_density", 0) / 0.1)
         )
         v_score = (
@@ -660,8 +673,11 @@ class QuantizeStage(PipelineStage):
         elif nc_cfg == "auto_medium":
             return min(24, max(8, int(uc // 4)))
         else:
-            if a.get("quantization_score", 0) > 0.7:
-                return max(4, min(20, int(uc)))
+            if a.get("quantization_score", 0) > 0.4:
+                # User preference: stepped colors (6 > 16 > 20)
+                if uc <= 10: return 6
+                elif uc <= 24: return 16
+                return 20
             return min(24, max(8, int(uc // 3)))
 
     def _quantize_exact(self, pixels: np.ndarray, n: int) -> List[Tuple[int, int, int]]:
